@@ -1,0 +1,1099 @@
+name: Build & Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Run mode"
+        type: choice
+        required: true
+        default: build
+        options:
+          - build
+          - release
+
+      release_tag:
+        description: "Release tag, e.g. v0.0.1"
+        type: string
+        required: false
+        default: ""
+
+      ios_device:
+        description: "Build signed iOS Device IPA"
+        type: boolean
+        required: false
+        default: false
+
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-build-${{ github.ref }}
+  cancel-in-progress: false
+
+
+# ============================================================
+# Prepare
+# ============================================================
+
+jobs:
+
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-24.04
+
+    outputs:
+      publish: ${{ steps.mode.outputs.publish }}
+      release_tag: ${{ steps.mode.outputs.release_tag }}
+
+    steps:
+
+      - name: Resolve mode
+        id: mode
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DISPATCH_MODE: ${{ inputs.mode }}
+          DISPATCH_TAG: ${{ inputs.release_tag }}
+          REF_NAME: ${{ github.ref_name }}
+
+        run: |
+          set -euo pipefail
+
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            publish=true
+            release_tag="$REF_NAME"
+
+          elif [[ "$DISPATCH_MODE" == "release" ]]; then
+            publish=true
+            release_tag="$DISPATCH_TAG"
+
+            if [[ -z "$release_tag" ]]; then
+              echo "release_tag is required when mode=release"
+              exit 1
+            fi
+
+          else
+            publish=false
+            release_tag=""
+          fi
+
+          if [[ "$publish" == "true" ]]; then
+
+            if [[ "$release_tag" != v* ]]; then
+              release_tag="v$release_tag"
+            fi
+
+            if [[ ! "$release_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+              echo "Invalid release tag: $release_tag"
+              exit 1
+            fi
+
+          fi
+
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+
+# ============================================================
+# Windows
+# ============================================================
+
+  windows:
+
+    name: Windows
+
+    needs: prepare
+
+    runs-on: windows-2025
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Task
+        shell: pwsh
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Install Wails 3
+        shell: pwsh
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.20
+
+          task --version
+          wails3 version
+
+      - name: Install NSIS
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            choco install nsis -y --no-progress
+          }
+
+          makensis /VERSION
+
+      - name: Build Windows artifacts
+        shell: pwsh
+        run: |
+
+          $ErrorActionPreference = "Stop"
+
+          Remove-Item -Recurse -Force dist,bin `
+            -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force dist,bin | Out-Null
+
+
+          # --------------------------------------------------
+          # Windows AMD64 NSIS
+          # --------------------------------------------------
+
+          task windows:package `
+            FORMAT=nsis `
+            ARCH=amd64 `
+            INSTALL_SCOPE=machine
+
+          $exe = Get-ChildItem bin -Filter "*-amd64.exe" |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "AMD64 executable not found"
+          }
+
+          Copy-Item `
+            $exe.FullName `
+            "dist/HEUOpenResource-windows-amd64.exe"
+
+
+          $installer = Get-ChildItem bin `
+            -Filter "*-amd64-installer.exe" |
+            Select-Object -First 1
+
+          if (-not $installer) {
+            throw "AMD64 NSIS installer not found"
+          }
+
+          Copy-Item `
+            $installer.FullName `
+            "dist/HEUOpenResource-windows-amd64-nsis.exe"
+
+
+          # --------------------------------------------------
+          # Windows ARM64 NSIS
+          # --------------------------------------------------
+
+          Remove-Item -Recurse -Force bin `
+            -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force bin | Out-Null
+
+          task windows:package `
+            FORMAT=nsis `
+            ARCH=arm64 `
+            INSTALL_SCOPE=machine
+
+          $exe = Get-ChildItem bin -Filter "*-arm64.exe" |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "ARM64 executable not found"
+          }
+
+          Copy-Item `
+            $exe.FullName `
+            "dist/HEUOpenResource-windows-arm64.exe"
+
+
+          $installer = Get-ChildItem bin `
+            -Filter "*-arm64-installer.exe" |
+            Select-Object -First 1
+
+          if (-not $installer) {
+            throw "ARM64 NSIS installer not found"
+          }
+
+          Copy-Item `
+            $installer.FullName `
+            "dist/HEUOpenResource-windows-arm64-nsis.exe"
+
+
+          # --------------------------------------------------
+          # Windows AMD64 MSIX
+          # --------------------------------------------------
+
+          Remove-Item -Recurse -Force bin `
+            -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force bin | Out-Null
+
+          task windows:package `
+            FORMAT=msix `
+            ARCH=amd64
+
+          $msix = Get-ChildItem bin -Filter "*.msix" |
+            Select-Object -First 1
+
+          if (-not $msix) {
+            throw "AMD64 MSIX not found"
+          }
+
+          Copy-Item `
+            $msix.FullName `
+            "dist/HEUOpenResource-windows-amd64.msix"
+
+
+          # --------------------------------------------------
+          # Windows ARM64 MSIX
+          # --------------------------------------------------
+
+          Remove-Item -Recurse -Force bin `
+            -ErrorAction SilentlyContinue
+
+          New-Item -ItemType Directory -Force bin | Out-Null
+
+          task windows:package `
+            FORMAT=msix `
+            ARCH=arm64
+
+          $msix = Get-ChildItem bin -Filter "*.msix" |
+            Select-Object -First 1
+
+          if (-not $msix) {
+            throw "ARM64 MSIX not found"
+          }
+
+          Copy-Item `
+            $msix.FullName `
+            "dist/HEUOpenResource-windows-arm64.msix"
+
+
+          Get-ChildItem dist
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+
+# ============================================================
+# Linux
+# ============================================================
+
+  linux:
+
+    name: Linux (${{ matrix.arch }})
+
+    needs: prepare
+
+    strategy:
+      fail-fast: false
+
+      matrix:
+        include:
+
+          - arch: amd64
+            runner: ubuntu-24.04
+
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Linux dependencies
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libgtk-4-dev \
+            libwebkitgtk-6.0-dev
+
+      - name: Install Task
+        shell: bash
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Install Wails 3
+        shell: bash
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.20
+
+          task --version
+          wails3 version
+
+      - name: Build Linux artifacts
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+
+        run: |
+
+          set -euo pipefail
+
+          rm -rf dist bin
+
+          mkdir -p dist
+
+          task linux:package ARCH="$ARCH"
+
+
+          # Raw executable
+
+          cp \
+            bin/heuopenresource \
+            "dist/HEUOpenResource-linux-$ARCH"
+
+
+          # Linux packages
+
+          shopt -s nullglob
+
+          files=(
+            bin/*.AppImage
+            bin/*.deb
+            bin/*.rpm
+            bin/*.pkg.tar.zst
+          )
+
+          if ((${#files[@]} == 0)); then
+            echo "No Linux packages were produced"
+            exit 1
+          fi
+
+          cp "${files[@]}" dist/
+
+
+          echo "Linux artifacts:"
+          ls -lah dist
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+
+# ============================================================
+# macOS
+# ============================================================
+
+  darwin:
+
+    name: macOS
+
+    needs: prepare
+
+    runs-on: macos-15
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Task
+        shell: bash
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Install Wails 3
+        shell: bash
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.20
+
+          task --version
+          wails3 version
+
+      - name: Build macOS artifacts
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          rm -rf dist bin
+
+          mkdir -p dist
+
+
+          # --------------------------------------------------
+          # arm64
+          # --------------------------------------------------
+
+          task darwin:package ARCH=arm64
+
+          cp \
+            bin/heuopenresource \
+            dist/HEUOpenResource-macos-arm64
+
+          ditto \
+            -c -k \
+            --sequesterRsrc \
+            --keepParent \
+            bin/heuopenresource.app \
+            dist/HEUOpenResource-macos-arm64.app.zip
+
+
+          # --------------------------------------------------
+          # amd64
+          # --------------------------------------------------
+
+          rm -rf bin
+          mkdir -p bin
+
+          task darwin:package ARCH=amd64
+
+          cp \
+            bin/heuopenresource \
+            dist/HEUOpenResource-macos-amd64
+
+          ditto \
+            -c -k \
+            --sequesterRsrc \
+            --keepParent \
+            bin/heuopenresource.app \
+            dist/HEUOpenResource-macos-amd64.app.zip
+
+
+          # --------------------------------------------------
+          # Universal
+          # --------------------------------------------------
+
+          rm -rf bin
+          mkdir -p bin
+
+          task darwin:package:universal
+
+          cp \
+            bin/heuopenresource \
+            dist/HEUOpenResource-macos-universal
+
+          ditto \
+            -c -k \
+            --sequesterRsrc \
+            --keepParent \
+            bin/heuopenresource.app \
+            dist/HEUOpenResource-macos-universal.app.zip
+
+
+          # --------------------------------------------------
+          # arm64 DMG
+          # --------------------------------------------------
+
+          rm -rf bin
+          mkdir -p bin
+
+          task darwin:package:dmg ARCH=arm64
+
+          dmg=$(find bin \
+            -maxdepth 1 \
+            -type f \
+            -name "*.dmg" \
+            -print \
+            -quit)
+
+          test -n "$dmg"
+
+          cp \
+            "$dmg" \
+            dist/HEUOpenResource-macos-arm64.dmg
+
+
+          # --------------------------------------------------
+          # amd64 DMG
+          # --------------------------------------------------
+
+          rm -rf bin
+          mkdir -p bin
+
+          task darwin:package:dmg ARCH=amd64
+
+          dmg=$(find bin \
+            -maxdepth 1 \
+            -type f \
+            -name "*.dmg" \
+            -print \
+            -quit)
+
+          test -n "$dmg"
+
+          cp \
+            "$dmg" \
+            dist/HEUOpenResource-macos-amd64.dmg
+
+
+          # --------------------------------------------------
+          # Universal DMG
+          # --------------------------------------------------
+
+          rm -rf bin
+          mkdir -p bin
+
+          task darwin:package:universal
+
+          task darwin:create:dmg
+
+          dmg=$(find bin \
+            -maxdepth 1 \
+            -type f \
+            -name "*.dmg" \
+            -print \
+            -quit)
+
+          test -n "$dmg"
+
+          cp \
+            "$dmg" \
+            dist/HEUOpenResource-macos-universal.dmg
+
+
+          echo "macOS artifacts:"
+          ls -lah dist
+
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: darwin
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+
+# ============================================================
+# Android
+# ============================================================
+
+  android:
+
+    name: Android
+
+    needs: prepare
+
+    runs-on: ubuntu-24.04
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK / NDK
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "ndk;26.3.11579264"
+
+      - name: Install Task
+        shell: bash
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Install Wails 3
+        shell: bash
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.20
+
+          task --version
+          wails3 version
+
+      - name: Fix CI Gradle version
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          # Current repository:
+          #
+          #   Android Gradle Plugin = 8.7.3
+          #   Gradle wrapper        = 9.2.1
+          #
+          # AGP 8.7 should use Gradle 8.9+.
+          #
+          # Keep repository files untouched and only use 8.9 in CI.
+
+          sed -i \
+            's/gradle-9\.2\.1-bin\.zip/gradle-8.9-bin.zip/' \
+            build/android/gradle/wrapper/gradle-wrapper.properties
+
+          grep '^distributionUrl=' \
+            build/android/gradle/wrapper/gradle-wrapper.properties
+
+      - name: Build Android artifacts
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          rm -rf dist bin
+
+          mkdir -p dist
+
+
+          # --------------------------------------------------
+          # ARM64 APK
+          # --------------------------------------------------
+
+          task android:package ARCH=arm64
+
+          mv \
+            bin/heuopenresource.apk \
+            dist/HEUOpenResource-android-arm64.apk
+
+
+          # --------------------------------------------------
+          # x86_64 APK
+          # --------------------------------------------------
+
+          task android:package ARCH=amd64
+
+          mv \
+            bin/heuopenresource.apk \
+            dist/HEUOpenResource-android-amd64.apk
+
+
+          # --------------------------------------------------
+          # Universal APK
+          # --------------------------------------------------
+
+          task android:package:fat
+
+          mv \
+            bin/heuopenresource.apk \
+            dist/HEUOpenResource-android-universal.apk
+
+
+          # --------------------------------------------------
+          # ARM64 AAB
+          # --------------------------------------------------
+
+          task android:bundle
+
+          mv \
+            bin/heuopenresource.aab \
+            dist/HEUOpenResource-android-arm64.aab
+
+
+          # --------------------------------------------------
+          # Universal AAB
+          # --------------------------------------------------
+
+          task android:bundle:fat
+
+          mv \
+            bin/heuopenresource.aab \
+            dist/HEUOpenResource-android-universal.aab
+
+
+          echo "Android artifacts:"
+          ls -lah dist
+
+      - name: Upload Android artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+
+# ============================================================
+# iOS
+# ============================================================
+
+  ios:
+
+    name: iOS
+
+    needs: prepare
+
+    runs-on: macos-15
+
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Task
+        shell: bash
+        run: |
+          go install github.com/go-task/task/v3/cmd/task@latest
+
+      - name: Install Wails 3
+        shell: bash
+        run: |
+          go install github.com/wailsapp/wails/v3/cmd/wails3@v3.0.0-beta.20
+
+          task --version
+          wails3 version
+
+      - name: Build iOS Simulator artifact
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          rm -rf dist bin
+
+          mkdir -p dist
+
+          task ios:package \
+            IOS_PLATFORM=simulator
+
+          ditto \
+            -c -k \
+            --sequesterRsrc \
+            --keepParent \
+            bin/heuopenresource.app \
+            dist/HEUOpenResource-ios-simulator.app.zip
+
+
+      # ------------------------------------------------------
+      # Optional physical-device IPA
+      # ------------------------------------------------------
+
+      - name: Check iOS signing secrets
+        if: ${{ inputs.ios_device == true }}
+        shell: bash
+        env:
+          IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+          IOS_SIGNING_IDENTITY: ${{ secrets.IOS_SIGNING_IDENTITY }}
+
+        run: |
+
+          set -euo pipefail
+
+          test -n "$IOS_CERT_P12_BASE64"
+          test -n "$IOS_CERT_PASSWORD"
+          test -n "$IOS_PROVISIONING_PROFILE_BASE64"
+          test -n "$IOS_KEYCHAIN_PASSWORD"
+          test -n "$IOS_SIGNING_IDENTITY"
+
+      - name: Prepare iOS signing
+        if: ${{ inputs.ios_device == true }}
+        shell: bash
+        env:
+          IOS_CERT_P12_BASE64: ${{ secrets.IOS_CERT_P12_BASE64 }}
+          IOS_CERT_PASSWORD: ${{ secrets.IOS_CERT_PASSWORD }}
+          IOS_PROVISIONING_PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+          IOS_KEYCHAIN_PASSWORD: ${{ secrets.IOS_KEYCHAIN_PASSWORD }}
+
+        run: |
+
+          set -euo pipefail
+
+          CERT_PATH="$RUNNER_TEMP/ios-signing.p12"
+
+          PROFILE_PATH="$RUNNER_TEMP/ios.mobileprovision"
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/ios-build.keychain-db"
+
+
+          printf '%s' "$IOS_CERT_P12_BASE64" |
+            base64 --decode > "$CERT_PATH"
+
+          printf '%s' "$IOS_PROVISIONING_PROFILE_BASE64" |
+            base64 --decode > "$PROFILE_PATH"
+
+
+          security create-keychain \
+            -p "$IOS_KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+          security set-keychain-settings \
+            -lut 21600 \
+            "$KEYCHAIN_PATH"
+
+          security unlock-keychain \
+            -p "$IOS_KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+
+          security import "$CERT_PATH" \
+            -P "$IOS_CERT_PASSWORD" \
+            -A \
+            -t cert \
+            -f pkcs12 \
+            "$KEYCHAIN_PATH"
+
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s \
+            -k "$IOS_KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+
+
+          security list-keychains \
+            -d user \
+            -s "$KEYCHAIN_PATH" login.keychain-db
+
+          security default-keychain \
+            -s "$KEYCHAIN_PATH"
+
+
+          PROFILE_PLIST="$RUNNER_TEMP/ios-profile.plist"
+
+          security cms \
+            -D \
+            -i "$PROFILE_PATH" \
+            > "$PROFILE_PLIST"
+
+
+          PROFILE_UUID=$(
+            /usr/libexec/PlistBuddy \
+              -c 'Print :UUID' \
+              "$PROFILE_PLIST"
+          )
+
+
+          PROFILE_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+
+          mkdir -p "$PROFILE_DIR"
+
+          cp \
+            "$PROFILE_PATH" \
+            "$PROFILE_DIR/$PROFILE_UUID.mobileprovision"
+
+
+          echo "IOS_PROFILE_PATH=$PROFILE_PATH" \
+            >> "$GITHUB_ENV"
+
+          echo "IOS_KEYCHAIN_PATH=$KEYCHAIN_PATH" \
+            >> "$GITHUB_ENV"
+
+      - name: Build iOS Device IPA
+        if: ${{ inputs.ios_device == true }}
+        shell: bash
+        env:
+          IOS_SIGNING_IDENTITY: ${{ secrets.IOS_SIGNING_IDENTITY }}
+
+        run: |
+
+          set -euo pipefail
+
+          task ios:package:ipa \
+            IOS_PLATFORM=device \
+            CODESIGN_IDENTITY="$IOS_SIGNING_IDENTITY" \
+            PROVISIONING_PROFILE="$IOS_PROFILE_PATH"
+
+          cp \
+            bin/heuopenresource.ipa \
+            dist/HEUOpenResource-ios-device.ipa
+
+      - name: Cleanup iOS signing
+        if: ${{ always() && inputs.ios_device == true }}
+        shell: bash
+        run: |
+
+          set +e
+
+          security delete-keychain \
+            "$IOS_KEYCHAIN_PATH" \
+            2>/dev/null || true
+
+          rm -f \
+            "$RUNNER_TEMP/ios-signing.p12" \
+            "$RUNNER_TEMP/ios.mobileprovision"
+
+      - name: Upload iOS artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+
+# ============================================================
+# Release
+# ============================================================
+
+  release:
+
+    name: Publish Release
+
+    needs:
+      - prepare
+      - windows
+      - linux
+      - darwin
+      - android
+      - ios
+
+    if: ${{ needs.prepare.outputs.publish == 'true' }}
+
+    runs-on: ubuntu-24.04
+
+    permissions:
+      contents: write
+
+    steps:
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS
+        shell: bash
+        run: |
+
+          set -euo pipefail
+
+          cd release
+
+          sha256sum * |
+            sort \
+            > SHA256SUMS.txt
+
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+
+        run: |
+
+          set -euo pipefail
+
+
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+
+            gh release create "$RELEASE_TAG" \
+              --target "$GITHUB_SHA" \
+              --title "HEUOpenResource $RELEASE_TAG" \
+              --generate-notes
+
+          fi
+
+
+          mapfile -t assets < <(
+            find release \
+              -maxdepth 1 \
+              -type f \
+              -print |
+            sort
+          )
+
+
+          if ((${#assets[@]} == 0)); then
+            echo "No release assets found"
+            exit 1
+          fi
+
+
+          gh release upload \
+            "$RELEASE_TAG" \
+            --clobber \
+            "${assets[@]}"
+
+
+          echo "Release published:"
+          echo "$RELEASE_TAG"
